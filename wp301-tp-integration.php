@@ -3,7 +3,7 @@
  * Plugin Name:  WP 301 Redirects Pro — TranslatePress Integration
  * Plugin URI:   https://github.com/hellomahfuzpro/wp301-tp-integration
  * Description:  Applies WP 301 Redirects Pro rules (exact + regex) to all TranslatePress translated language URLs.
- * Version:      2.1.0
+ * Version:      2.2.0
  * Author:       Mahfuz
  * Author URI:   https://github.com/hellomahfuzpro
  * License:      GPL-2.0+
@@ -69,18 +69,6 @@ function wptp_empty_lang(): array {
 }
 
 /* ────────────────────────────────────────────────────────────────
- *  Helper: build final redirect destination with language prefix
- * ──────────────────────────────────────────────────────────────── */
-
-function wptp_build_destination(string $dest, string $locale, array $lang): string {
-	if (preg_match('#^https?://#i', $dest)) {
-		return $dest;
-	}
-	$slug = $lang['locale_to_slug'][$locale] ?? strtok($locale, '_');
-	return '/' . $slug . '/' . ltrim($dest, '/');
-}
-
-/* ────────────────────────────────────────────────────────────────
  *  Main redirect handler
  * ──────────────────────────────────────────────────────────────── */
 
@@ -107,7 +95,6 @@ function wptp_handle_redirect(): void {
 
 	// ── Parse the URL ──────────────────────────────────────────
 	$uri = urldecode($_SERVER['REQUEST_URI'] ?? '');
-	// Strip query string
 	$uri = strtok($uri, '?');
 	$uri = rtrim($uri, '/');
 
@@ -170,7 +157,6 @@ function wptp_handle_redirect(): void {
 		return;
 	}
 
-	// Prefer the 301 plugin's own pattern matching if available
 	$use_builtin = class_exists('WF301_functions');
 
 	foreach ($rules as $rule) {
@@ -182,10 +168,7 @@ function wptp_handle_redirect(): void {
 		$matches = false;
 
 		if ($use_builtin) {
-			// Use WF301_functions::format_from_url + wild_compare for maximum
-			// compatibility with the plugin's own pattern syntax (fnmatch-style
-			// wildcards, {duplicate-slug}, etc.)
-			$formatted_from = WF301_functions::format_from_url(ltrim($pattern, '/'));
+			$formatted_from   = WF301_functions::format_from_url(ltrim($pattern, '/'));
 			$case_insensitive = ($rule->case_insensitive ?? 'enabled') === 'enabled';
 
 			if (WF301_functions::wild_compare($formatted_from, $path, $case_insensitive, $matches)) {
@@ -200,7 +183,6 @@ function wptp_handle_redirect(): void {
 				wptp_do_redirect($dest, (int) $rule->type, $locale, $lang);
 			}
 		} else {
-			// Fallback: plain preg_match
 			$matched = @preg_match('~' . $pattern . '~iu', $path, $matches);
 			if ($matched !== 1) {
 				continue;
@@ -222,25 +204,48 @@ function wptp_handle_redirect(): void {
 }
 
 /**
- * Send the redirect and exit.
+ * Build the redirect destination URL and send headers.
+ *
+ * Uses header() directly to match the 301 plugin's approach.
+ * Builds a relative URL (/slug/destination) — intentionally NOT
+ * using home_url() because TranslatePress filters it and would
+ * double-prefix the language slug (e.g. /zh/zh/ instead of /zh/).
  */
 function wptp_do_redirect(string $dest, int $type, string $locale, array $lang): void {
-	$final = wptp_build_destination($dest, $locale, $lang);
-	$code  = in_array($type, [301, 302, 307, 308], true) ? $type : 301;
+	$code = in_array($type, [301, 302, 307, 308], true) ? $type : 301;
 
-	// Mimic 301 plugin cache headers
+	// Build final URL with language prefix
+	if (preg_match('#^https?://#i', $dest)) {
+		$final = $dest;
+	} else {
+		$slug  = $lang['locale_to_slug'][$locale] ?? strtok($locale, '_');
+		$final = '/' . $slug . '/' . ltrim($dest, '/');
+	}
+
+	// HTTP status text map
+	$status_texts = [
+		301 => 'Moved Permanently',
+		302 => 'Moved Temporarily',
+		307 => 'Temporary Redirect',
+		308 => 'Permanent Redirect',
+	];
+	$status_text = $status_texts[$code] ?? 'Moved Permanently';
+
+	// Send exactly the same headers as the 301 plugin
 	if (!headers_sent()) {
 		header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 		header('Cache-Control: post-check=0, pre-check=0', false);
 		header('Pragma: no-cache');
+		header("HTTP/1.1 {$code} {$status_text}");
+		header("Location: {$final}");
 	}
 
-	wp_redirect($final, $code);
 	exit;
 }
 
 // ── Bootstrap ──────────────────────────────────────────────────
-// Priority 0 on 'init' ensures we run BEFORE the 301 plugin,
-// which hooks at 'init' priority 1 (when redirect_init is on)
-// or 'template_redirect' priority 1 (when redirect_init is off).
-add_action('init', 'wptp_handle_redirect', 0);
+// Priority 0 on template_redirect: runs before the 301 plugin's
+// template_redirect:1, and after the 301 plugin's init:1 (which
+// won't match because of the language prefix, so it returns false
+// and WordPress continues to template_redirect).
+add_action('template_redirect', 'wptp_handle_redirect', 0);
