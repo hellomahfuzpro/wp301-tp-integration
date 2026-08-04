@@ -206,10 +206,9 @@ function wptp_handle_redirect(): void {
 /**
  * Build the redirect destination URL and send headers.
  *
- * Uses header() directly to match the 301 plugin's approach.
- * Builds a relative URL (/slug/destination) — intentionally NOT
- * using home_url() because TranslatePress filters it and would
- * double-prefix the language slug (e.g. /zh/zh/ instead of /zh/).
+ * Constructs an absolute URL using the UNFILTERED home option
+ * (get_option('home')) to avoid TranslatePress's add_language_to_home_url
+ * filter double-prefixing the language slug (e.g. /zh/zh/).
  */
 function wptp_do_redirect(string $dest, int $type, string $locale, array $lang): void {
 	$code = in_array($type, [301, 302, 307, 308], true) ? $type : 301;
@@ -218,8 +217,9 @@ function wptp_do_redirect(string $dest, int $type, string $locale, array $lang):
 	if (preg_match('#^https?://#i', $dest)) {
 		$final = $dest;
 	} else {
+		$home  = rtrim(get_option('home'), '/');
 		$slug  = $lang['locale_to_slug'][$locale] ?? strtok($locale, '_');
-		$final = '/' . $slug . '/' . ltrim($dest, '/');
+		$final = $home . '/' . $slug . '/' . ltrim($dest, '/');
 	}
 
 	// HTTP status text map
