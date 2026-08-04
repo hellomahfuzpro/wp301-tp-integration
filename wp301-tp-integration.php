@@ -3,31 +3,22 @@
  * Plugin Name:  WP 301 Redirects Pro — TranslatePress Integration
  * Plugin URI:   https://github.com/hellomahfuzpro/wp301-tp-integration
  * Description:  Applies WP 301 Redirects Pro rules (exact + regex) to all TranslatePress translated language URLs.
- * Version:      2.0.0
+ * Version:      2.1.0
  * Author:       Mahfuz
  * Author URI:   https://github.com/hellomahfuzpro
  * License:      GPL-2.0+
  * Requires WP:  5.0
  * Requires PHP: 7.4
  *
- * Tested with:  WP 301 Redirects Pro (latest), TranslatePress Multilingual 3.2.6+
+ * Tested with:  WP 301 Redirects Pro 5.x, TranslatePress Multilingual 3.2.6+
  */
 
 defined('ABSPATH') || exit;
 
-/**
- * Get active TranslatePress language configuration.
- *
- * Reads trp_settings and builds slug↔locale maps respecting
- * custom URL slugs and the "add subdirectory to default language" setting.
- *
- * @return array{
- *   default: string,
- *   slugs: string[],
- *   slug_to_locale: array<string,string>,
- *   locale_to_slug: array<string,string>,
- * }
- */
+/* ────────────────────────────────────────────────────────────────
+ *  Helper: get TranslatePress language configuration
+ * ──────────────────────────────────────────────────────────────── */
+
 function wptp_get_languages(): array {
 	static $cache = null;
 	if ($cache !== null) {
@@ -35,12 +26,7 @@ function wptp_get_languages(): array {
 	}
 
 	if (!class_exists('TRP_Translate_Press')) {
-		return $cache = [
-			'default'         => '',
-			'slugs'           => [],
-			'slug_to_locale'  => [],
-			'locale_to_slug'  => [],
-		];
+		return $cache = wptp_empty_lang();
 	}
 
 	$trp      = TRP_Translate_Press::get_trp_instance();
@@ -48,12 +34,7 @@ function wptp_get_languages(): array {
 	$all      = $settings->get_settings();
 
 	if (empty($all)) {
-		return $cache = [
-			'default'         => '',
-			'slugs'           => [],
-			'slug_to_locale'  => [],
-			'locale_to_slug'  => [],
-		];
+		return $cache = wptp_empty_lang();
 	}
 
 	$default    = $all['default-language'] ?? '';
@@ -66,17 +47,13 @@ function wptp_get_languages(): array {
 	$active_slugs   = [];
 
 	foreach ($published as $locale) {
-		// Respect "add subdirectory to default language" setting
 		if ($locale === $default && $add_subdir !== 'yes') {
 			continue;
 		}
-
-		// Use custom URL slug if defined, otherwise fall back to 2-letter prefix
 		$slug = $url_slugs[$locale] ?? strtok($locale, '_');
-
-		$slug_to_locale[$slug] = $locale;
+		$slug_to_locale[$slug]   = $locale;
 		$locale_to_slug[$locale] = $slug;
-		$active_slugs[] = $slug;
+		$active_slugs[]          = $slug;
 	}
 
 	return $cache = [
@@ -87,93 +64,80 @@ function wptp_get_languages(): array {
 	];
 }
 
-/**
- * Build the final destination URL for a matched redirect rule.
- *
- * If the destination is already an absolute URL, return it as-is.
- * Otherwise prepend the language slug so the redirect stays within
- * the same translated subdirectory.
- *
- * @param string $dest      Raw destination from the redirect rule.
- * @param string $locale    Full locale code (e.g. fr_FR).
- * @param array  $languages Output of wptp_get_languages().
- * @return string
- */
-function wptp_build_destination(string $dest, string $locale, array $languages): string {
-	// Absolute external URL — pass through unchanged
+function wptp_empty_lang(): array {
+	return ['default' => '', 'slugs' => [], 'slug_to_locale' => [], 'locale_to_slug' => []];
+}
+
+/* ────────────────────────────────────────────────────────────────
+ *  Helper: build final redirect destination with language prefix
+ * ──────────────────────────────────────────────────────────────── */
+
+function wptp_build_destination(string $dest, string $locale, array $lang): string {
 	if (preg_match('#^https?://#i', $dest)) {
 		return $dest;
 	}
-
-	// Get the correct URL slug for this locale
-	$slug = $languages['locale_to_slug'][$locale] ?? strtok($locale, '_');
-
+	$slug = $lang['locale_to_slug'][$locale] ?? strtok($locale, '_');
 	return '/' . $slug . '/' . ltrim($dest, '/');
 }
 
-/**
- * Apply WP 301 Redirects Pro rules to translated URLs.
- *
- * Hooks into template_redirect at priority 1 (before the built-in
- * 301 plugin runs at default priority) so translated URLs are
- * intercepted first.
- *
- * Flow:
- *  1. Parse the language slug from the URL.
- *  2. Extract the remaining path (without the language prefix).
- *  3. Try exact-match rules against the remaining path.
- *  4. If no exact match, try regex rules.
- *  5. On match, rebuild the destination with the language prefix and redirect.
- */
+/* ────────────────────────────────────────────────────────────────
+ *  Main redirect handler
+ * ──────────────────────────────────────────────────────────────── */
+
 function wptp_handle_redirect(): void {
-	if (is_admin()) {
+	if (is_admin() || wp_doing_cron() || wp_doing_ajax()) {
 		return;
 	}
 
-	$languages = wptp_get_languages();
-	if (empty($languages['slugs'])) {
+	// Respect the 301 plugin's own "disable all redirections" flag
+	if (class_exists('WF301_setup')) {
+		$opts = WF301_setup::get_options();
+		if (
+			!empty($opts['disable_all_redirections']) ||
+			(!empty($opts['disable_for_users']) && is_user_logged_in())
+		) {
+			return;
+		}
+	}
+
+	$lang = wptp_get_languages();
+	if (empty($lang['slugs'])) {
 		return;
 	}
 
-	// ── Parse request URI ──────────────────────────────────────
-	$uri = rtrim(urldecode(strtok($_SERVER['REQUEST_URI'] ?? '', '?')), '/');
+	// ── Parse the URL ──────────────────────────────────────────
+	$uri = urldecode($_SERVER['REQUEST_URI'] ?? '');
+	// Strip query string
+	$uri = strtok($uri, '?');
+	$uri = rtrim($uri, '/');
 
 	if (empty($uri)) {
 		return;
 	}
 
-	// Build regex to match any active language slug as the first segment
-	$quoted = array_map('preg_quote', $languages['slugs']);
-	$lang_pattern = implode('|', $quoted);
-
-	// Captures: group 1 = language slug, group 2 = remaining path
-	if (!preg_match("#^/({$lang_pattern})(?:/(.*))?$#ui", $uri, $m)) {
+	// Does it start with a known language slug?
+	$pattern = '#^/(' . implode('|', array_map('preg_quote', $lang['slugs'])) . ')(?:/(.*))?$#ui';
+	if (!preg_match($pattern, $uri, $m)) {
 		return;
 	}
 
-	$lang_slug = $m[1];
-	$path      = !empty($m[2]) ? '/' . trim($m[2], '/') : '';
+	$slug   = $m[1];
+	$path   = !empty($m[2]) ? '/' . trim($m[2], '/') : '';
+	$locale = $lang['slug_to_locale'][$slug] ?? null;
 
-	// No sub-path to redirect — nothing to do
-	if ($path === '' || $path === '/') {
-		return;
-	}
-
-	// Resolve the full locale from the URL slug
-	$locale = $languages['slug_to_locale'][$lang_slug] ?? null;
-	if (!$locale) {
+	if (!$locale || $path === '' || $path === '/') {
 		return;
 	}
 
 	global $wpdb;
 	$table = $wpdb->prefix . 'wf301_redirect_rules';
 
-	// ── Step 1: Exact-match redirects ──────────────────────────
-	$variants = array_unique([
+	// ── Exact-match: try path, path/, and path without trailing slash ──
+	$variants = array_values(array_unique([
 		$path,
 		$path . '/',
 		rtrim($path, '/'),
-	]);
+	]));
 
 	$placeholders = implode(',', array_fill(0, count($variants), '%s'));
 
@@ -192,13 +156,10 @@ function wptp_handle_redirect(): void {
 	// phpcs:enable
 
 	if ($rule) {
-		$final = wptp_build_destination(trim($rule->url_to), $locale, $languages);
-		$code  = in_array((int) $rule->type, [301, 302, 307], true) ? (int) $rule->type : 301;
-		wp_redirect($final, $code);
-		exit;
+		wptp_do_redirect(trim($rule->url_to), (int) $rule->type, $locale, $lang);
 	}
 
-	// ── Step 2: Regex redirects ────────────────────────────────
+	// ── Regex rules ────────────────────────────────────────────
 	$rules = $wpdb->get_results(
 		"SELECT * FROM {$table}
 		 WHERE status = 'enabled' AND regex = 'enabled'
@@ -209,42 +170,77 @@ function wptp_handle_redirect(): void {
 		return;
 	}
 
+	// Prefer the 301 plugin's own pattern matching if available
+	$use_builtin = class_exists('WF301_functions');
+
 	foreach ($rules as $rule) {
 		$pattern = stripslashes(trim($rule->url_from));
-
-		// Normalise: ensure pattern starts with /
 		if ($pattern !== '' && $pattern[0] !== '/') {
 			$pattern = '/' . $pattern;
 		}
 
-		// Suppress warnings from malformed user regex
-		$matched = @preg_match('~' . $pattern . '~iu', $path, $matches);
-		if ($matched !== 1) {
-			continue;
-		}
+		$matches = false;
 
-		$dest = trim($rule->url_to);
+		if ($use_builtin) {
+			// Use WF301_functions::format_from_url + wild_compare for maximum
+			// compatibility with the plugin's own pattern syntax (fnmatch-style
+			// wildcards, {duplicate-slug}, etc.)
+			$formatted_from = WF301_functions::format_from_url(ltrim($pattern, '/'));
+			$case_insensitive = ($rule->case_insensitive ?? 'enabled') === 'enabled';
 
-		// Replace named captures: [name]
-		foreach ($matches as $key => $value) {
-			if (is_string($key)) {
-				$dest = str_replace("[$key]", $value, $dest);
+			if (WF301_functions::wild_compare($formatted_from, $path, $case_insensitive, $matches)) {
+				$dest = trim($rule->url_to);
+				if (is_array($matches) && !empty($matches)) {
+					foreach ($matches as $k => $v) {
+						if (is_string($k)) {
+							$dest = str_replace("[$k]", trim($v, ' /'), $dest);
+						}
+					}
+				}
+				wptp_do_redirect($dest, (int) $rule->type, $locale, $lang);
 			}
-		}
-
-		// Replace numbered captures: $1…$9 and [1]…[9]
-		for ($i = 1; $i <= 9; $i++) {
-			if (isset($matches[$i])) {
-				$dest = str_replace(["\${$i}", "[{$i}]"], $matches[$i], $dest);
+		} else {
+			// Fallback: plain preg_match
+			$matched = @preg_match('~' . $pattern . '~iu', $path, $matches);
+			if ($matched !== 1) {
+				continue;
 			}
+			$dest = trim($rule->url_to);
+			foreach ($matches as $k => $v) {
+				if (is_string($k)) {
+					$dest = str_replace("[$k]", $v, $dest);
+				}
+			}
+			for ($i = 1; $i <= 9; $i++) {
+				if (isset($matches[$i])) {
+					$dest = str_replace(["\${$i}", "[{$i}]"], $matches[$i], $dest);
+				}
+			}
+			wptp_do_redirect($dest, (int) $rule->type, $locale, $lang);
 		}
-
-		$final = wptp_build_destination($dest, $locale, $languages);
-		$code  = in_array((int) $rule->type, [301, 302, 307], true) ? (int) $rule->type : 301;
-		wp_redirect($final, $code);
-		exit;
 	}
 }
 
+/**
+ * Send the redirect and exit.
+ */
+function wptp_do_redirect(string $dest, int $type, string $locale, array $lang): void {
+	$final = wptp_build_destination($dest, $locale, $lang);
+	$code  = in_array($type, [301, 302, 307, 308], true) ? $type : 301;
+
+	// Mimic 301 plugin cache headers
+	if (!headers_sent()) {
+		header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+		header('Cache-Control: post-check=0, pre-check=0', false);
+		header('Pragma: no-cache');
+	}
+
+	wp_redirect($final, $code);
+	exit;
+}
+
 // ── Bootstrap ──────────────────────────────────────────────────
-add_action('template_redirect', 'wptp_handle_redirect', 1);
+// Priority 0 on 'init' ensures we run BEFORE the 301 plugin,
+// which hooks at 'init' priority 1 (when redirect_init is on)
+// or 'template_redirect' priority 1 (when redirect_init is off).
+add_action('init', 'wptp_handle_redirect', 0);
